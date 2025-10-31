@@ -45,7 +45,7 @@ namespace INFOIBV
             FindLineCrossings,
             BinaryPipeline,
             GrayscalePipeline,
-            DetectTrafficSigns
+            DetectManholes
         }
 
         /*
@@ -258,9 +258,9 @@ namespace INFOIBV
                         OutputImage.SetPixel(x, y, newColor);
                     }
             }
-            else if ((ProcessingFunctions)comboBox.SelectedIndex == ProcessingFunctions.DetectTrafficSigns)
+            else if ((ProcessingFunctions)comboBox.SelectedIndex == ProcessingFunctions.DetectManholes)
             {
-                byte[,,] rgbResult = detectTrafficSigns(workingImage);
+                byte[,,] rgbResult = detectManholes(workingImage);
                 OutputImage = new Bitmap(rgbResult.GetLength(1), rgbResult.GetLength(0));
                 
                 for (int x = 0; x < rgbResult.GetLength(1); x++)
@@ -1852,1116 +1852,875 @@ namespace INFOIBV
         // ====================================================================
         // ============= YOUR FUNCTIONS FOR ASSIGNMENT 3 GO HERE ==============
         // ====================================================================
-
+        
         /*
-        * TrafficSignCandidate: Represents a potential traffic sign
+        * detectManholes: REDESIGNED - Adaptive ellipse detection for metallic manholes
         */
-        private class TrafficSignCandidate
+        private byte[,,] detectManholes(byte[,] inputImage)
         {
-            public string Type { get; set; }  // "Circle" or "Triangle"
-            public int CenterX { get; set; }
-            public int CenterY { get; set; }
-            public double Radius { get; set; }  // For circles
-            public List<(int x, int y)> Corners { get; set; }  // For triangles
-            public double Confidence { get; set; }
-            public double Compactness { get; set; }
-            public int Area { get; set; }
-        }
-
-                /*
-        * detectTrafficSigns: REVISED - Focus on finding actual circular boundaries
-        */
-        private byte[,,] detectTrafficSigns(byte[,] inputImage)
-        {
-            StringBuilder log = new StringBuilder();
-            log.AppendLine("=== TRAFFIC SIGN DETECTION PIPELINE (REVISED) ===\n");
+            StringBuilder debugLog = new StringBuilder();
+            debugLog.AppendLine("=== MANHOLE DETECTION (ADAPTIVE) ===\n");
             
             int originalH = inputImage.GetLength(0);
             int originalW = inputImage.GetLength(1);
             
-            log.AppendLine($"Original size: {originalW} x {originalH}");
+            debugLog.AppendLine($"Original input: {originalW} x {originalH}\n");
             
-            // PHASE 0: DOWNSCALING
-            int maxDimension = 800;
-            byte[,] workingImage = downscaleImageGrayscale(inputImage, maxDimension);
+            // ========================================
+            // STEP 0: DOWNSCALING
+            // ========================================
+            int maxProcessingDimension = 800;
+            byte[,] processingImage = inputImage;
+            double scaleFactor = 1.0;
+            bool wasDownscaled = false;
             
-            int h = workingImage.GetLength(0);
-            int w = workingImage.GetLength(1);
-            double scaleRatio = (double)originalW / w;
-            
-            log.AppendLine($"Working size: {w} x {h} (scale: {scaleRatio:F2}x)\n");
-            
-            // PHASE 1: MULTI-SCALE EDGE DETECTION
-            // Try to catch edges at different intensity levels
-            log.AppendLine("PHASE 1: Multi-threshold Edge Detection");
-            
-            // Apply histogram equalization first
-            byte[,] equalized = histogramEqualization(workingImage);
-            
-            // Light smoothing
-            float[,] gaussianFilter = createGaussianFilter(3, 0.8f);
-            byte[,] smoothed = convolveImage(equalized, gaussianFilter);
-            
-            // Compute edge magnitude
-            byte[,] edgeMag = edgeMagnitude(smoothed, SobelX, SobelY);
-            
-            saveDebugImage(edgeMag, "edge_magnitude.png");
-            
-            // Create THREE binary edge maps with different thresholds
-            byte[,] edges1 = thresholdImage(edgeMag, calculateAdaptiveThreshold(edgeMag, 0.10)); // Top 10%
-            byte[,] edges2 = thresholdImage(edgeMag, calculateAdaptiveThreshold(edgeMag, 0.20)); // Top 20%
-            byte[,] edges3 = thresholdImage(edgeMag, calculateAdaptiveThreshold(edgeMag, 0.40)); // Top 40%
-            
-            log.AppendLine($"  Created 3 edge maps with thresholds: 10%, 20%, 40%");
-            
-            // Combine edge maps (OR operation)
-            byte[,] combinedEdges = new byte[h, w];
-            for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++)
-                    combinedEdges[y, x] = (byte)(Math.Max(edges1[y, x], Math.Max(edges2[y, x], edges3[y, x])));
-            
-            saveDebugImage(combinedEdges, "combined_edges.png");
-            
-            // PHASE 2: MORPHOLOGICAL PROCESSING
-            log.AppendLine("\nPHASE 2: Morphological Operations");
-            
-            // SKIP closing - it destroys the circular structure!
-            // Just use the combined edges directly
-            byte[,] closed = combinedEdges; // Use edges directly, no closing!
-            
-            log.AppendLine("  → Skipping morphological closing (preserves circular edges)");
-            
-            saveDebugImage(closed, "closed_edges.png");
-            
-            // PHASE 3: CIRCLE DETECTION WITH GRADIENT DIRECTION
-            log.AppendLine("\nPHASE 3: Circle Detection with Gradient Voting");
-            
-            // HUGE minimum radius - in 800px image, minimum is 40px
-            // In original 2000px image, that would be 100px radius minimum
-            int minRadius = Math.Max(40, (int)(80 / scaleRatio)); // 80px in ORIGINAL scale
-            int maxRadius = Math.Max(minRadius + 40, (int)(250 / scaleRatio)); // 250px max in original
-            
-            log.AppendLine($"  Searching radius range: {minRadius}-{maxRadius} px (scaled)");
-            log.AppendLine($"  Original scale: {(int)(minRadius*scaleRatio)}-{(int)(maxRadius*scaleRatio)} px");
-            log.AppendLine($"  This is VERY LARGE - only major circular signs will be detected\n");
-            
-            var circleCandidates = detectCirclesWithGradient(smoothed, edgeMag, closed, minRadius, maxRadius, log);
-            
-            log.AppendLine($"\n  → Found {circleCandidates.Count} circle candidates");
-            
-            // PHASE 4: STRICT FILTERING
-            log.AppendLine("\nPHASE 4: Filtering (VERY RELAXED)");
-            
-            var filteredCircles = new List<TrafficSignCandidate>();
-            
-            foreach (var circle in circleCandidates)
+            if (originalH > maxProcessingDimension || originalW > maxProcessingDimension)
             {
-                // Must be in upper 95% of image
-                if (circle.CenterY > h * 0.95)
-                {
-                    log.AppendLine($"  Rejected: ({circle.CenterX},{circle.CenterY}) too low");
-                    continue;
-                }
+                debugLog.AppendLine("STEP 0: Downscaling");
+                processingImage = downscaleImageGrayscale(inputImage, maxProcessingDimension);
                 
-                // Must have reasonable radius
-                if (circle.Radius < minRadius || circle.Radius > maxRadius)
-                {
-                    log.AppendLine($"  Rejected: ({circle.CenterX},{circle.CenterY}) radius {circle.Radius} out of range");
-                    continue;
-                }
+                int newH = processingImage.GetLength(0);
+                int newW = processingImage.GetLength(1);
                 
-                // SUPER RELAXED thresholds: 20% compactness, 8% confidence
-                if (circle.Compactness < 0.20 || circle.Confidence < 0.08)
-                {
-                    log.AppendLine($"  Rejected: ({circle.CenterX},{circle.CenterY}) compact={circle.Compactness:F2} conf={circle.Confidence:F2}");
-                    continue;
-                }
+                scaleFactor = (double)newH / originalH;
+                wasDownscaled = true;
                 
-                log.AppendLine($"  ✓ ACCEPTED: ({circle.CenterX},{circle.CenterY}), r={circle.Radius}, compact={circle.Compactness:F2}, conf={circle.Confidence:F2}");
-                filteredCircles.Add(circle);
+                debugLog.AppendLine($"  Downscaled to: {newW} x {newH}\n");
             }
             
-            log.AppendLine($"  → {filteredCircles.Count} circles after filtering");
+            int h = processingImage.GetLength(0);
+            int w = processingImage.GetLength(1);
             
-            // PHASE 5: VISUALIZATION
-            log.AppendLine("\nPHASE 5: Visualization");
-            byte[,,] output = drawTrafficSigns(workingImage, filteredCircles, log);
+            // ========================================
+            // STEP 1: DETECT BRIGHT METALLIC REGIONS
+            // ========================================
+            debugLog.AppendLine("STEP 1: Detect Bright Metallic Regions");
             
-            log.AppendLine($"\n=== FINAL: {filteredCircles.Count} traffic signs detected ===");
-            log.AppendLine("\nDEBUG FILES:");
-            log.AppendLine("  - edge_magnitude.png (raw edges)");
-            log.AppendLine("  - combined_edges.png (multi-threshold)");
-            log.AppendLine("  - closed_edges.png (after morphology)");
+            // Smooth first
+            float[,] gaussianFilter = createGaussianFilter(5, 1.5f);
+            byte[,] smoothed = convolveImage(processingImage, gaussianFilter);
             
-            MessageBox.Show(log.ToString(), "Traffic Sign Detection", 
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            // Find BRIGHT regions (manholes are metallic = bright)
+            // Calculate adaptive threshold based on image brightness
+            long sumIntensity = 0;
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                    sumIntensity += smoothed[y, x];
+            
+            double avgIntensity = sumIntensity / (double)(h * w);
+            byte brightnessThreshold = (byte)Math.Max(avgIntensity + 30, 140); // Bright regions
+            
+            byte[,] brightRegions = thresholdImage(smoothed, brightnessThreshold);
+            
+            debugLog.AppendLine($"  Avg intensity: {avgIntensity:F1}");
+            debugLog.AppendLine($"  Brightness threshold: {brightnessThreshold}");
+            
+            int brightPixels = 0;
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                    if (brightRegions[y, x] > 0)
+                        brightPixels++;
+            
+            debugLog.AppendLine($"  Bright pixels: {brightPixels} ({(brightPixels * 100.0 / (h * w)):F1}%)\n");
+            
+            saveDebugImage(brightRegions, "debug_1_bright_regions");
+            
+            // ========================================
+            // STEP 2: FIND CIRCULAR BRIGHT BLOBS
+            // ========================================
+            debugLog.AppendLine("STEP 2: Find Circular Bright Blobs");
+            
+            // Morphological closing to connect nearby bright regions
+            bool[,] structElem = new bool[9, 9];
+            for (int i = 0; i < 9; i++)
+                for (int j = 0; j < 9; j++)
+                    structElem[i, j] = true;
+            
+            byte[,] dilated = binaryDilateImage(brightRegions, structElem);
+            byte[,] closed = binaryErodeImage(dilated, structElem);
+            
+            saveDebugImage(closed, "debug_2_closed_blobs");
+            
+            // Label connected components
+            int blobCount;
+            byte[,] labeled = sequentialRegionLabeling(closed, out blobCount);
+            
+            debugLog.AppendLine($"  Bright blobs found: {blobCount}\n");
+            
+            // ========================================
+            // STEP 3: ANALYZE EACH BLOB FOR CIRCULARITY
+            // ========================================
+            debugLog.AppendLine("STEP 3: Analyze Blob Circularity");
+            
+            // Only search in right 75% (ground region)
+            int minX = (int)(w * 0.25);
+            
+            List<ManholeCandidate> candidates = new List<ManholeCandidate>();
+            
+            for (byte label = 2; label < blobCount + 2; label++)
+            {
+                List<(int x, int y)> blobPixels = new List<(int x, int y)>();
+                
+                // Extract all pixels of this blob
+                for (int y = 0; y < h; y++)
+                    for (int x = minX; x < w; x++) // Only search in ground region
+                        if (labeled[y, x] == label)
+                            blobPixels.Add((x, y));
+                
+                if (blobPixels.Count < 50) continue; // Too small
+                
+                // Calculate blob properties
+                double centerX = blobPixels.Average(p => (double)p.x);
+                double centerY = blobPixels.Average(p => (double)p.y);
+                
+                // Calculate distances from center
+                var distances = blobPixels.Select(p => 
+                    Math.Sqrt((p.x - centerX) * (p.x - centerX) + (p.y - centerY) * (p.y - centerY))).ToList();
+                
+                double avgRadius = distances.Average();
+                double stdRadius = Math.Sqrt(distances.Average(d => Math.Pow(d - avgRadius, 2)));
+                double circularity = 1.0 - Math.Min(stdRadius / avgRadius, 1.0);
+                
+                // Calculate elongation
+                double varX = blobPixels.Average(p => Math.Pow(p.x - centerX, 2));
+                double varY = blobPixels.Average(p => Math.Pow(p.y - centerY, 2));
+                double elongation = Math.Max(varX, varY) / Math.Min(varX, varY);
+                
+                debugLog.AppendLine($"  Blob {label - 1}:");
+                debugLog.AppendLine($"    Center: ({centerX:F0}, {centerY:F0})");
+                debugLog.AppendLine($"    Pixels: {blobPixels.Count}");
+                debugLog.AppendLine($"    Avg radius: {avgRadius:F1}");
+                debugLog.AppendLine($"    Circularity: {circularity:F2}");
+                debugLog.AppendLine($"    Elongation: {elongation:F2}");
+                
+                // Accept if reasonably circular and elongated (perspective ellipse)
+                if (circularity > 0.55 && elongation < 6.0 && blobPixels.Count > 100)
+                {
+                    candidates.Add(new ManholeCandidate
+                    {
+                        centerX = centerX,
+                        centerY = centerY,
+                        avgRadius = avgRadius,
+                        circularity = circularity,
+                        elongation = elongation,
+                        blobPixels = blobPixels
+                    });
+                    
+                    debugLog.AppendLine($"    ✓ CANDIDATE\n");
+                }
+                else
+                {
+                    debugLog.AppendLine($"    ✗ Rejected\n");
+                }
+            }
+            
+            debugLog.AppendLine($"  → Candidates: {candidates.Count}\n");
+            
+            // ========================================
+            // STEP 4: FIT ADAPTIVE ELLIPSES TO CANDIDATES
+            // ========================================
+            debugLog.AppendLine("STEP 4: Fit Adaptive Ellipses");
+            
+            List<EllipseParams> detectedEllipses = new List<EllipseParams>();
+            
+            foreach (var candidate in candidates)
+            {
+                // Use edge points around the blob boundary for ellipse fitting
+                byte[,] edges = edgeMagnitude(smoothed, SobelX, SobelY);
+                
+                List<(int x, int y)> edgePoints = new List<(int x, int y)>();
+                
+                // Find edges near the expected ellipse boundary
+                double searchRadius = candidate.avgRadius * 1.2;
+                
+                foreach (var (x, y) in candidate.blobPixels)
+                {
+                    double dist = Math.Sqrt((x - candidate.centerX) * (x - candidate.centerX) + 
+                                        (y - candidate.centerY) * (y - candidate.centerY));
+                    
+                    // Check if near boundary
+                    if (Math.Abs(dist - candidate.avgRadius) < candidate.avgRadius * 0.3)
+                    {
+                        // Check if there's an edge here
+                        if (edges[y, x] > 50)
+                            edgePoints.Add((x, y));
+                    }
+                }
+                
+                // If not enough edge points, use blob boundary pixels
+                if (edgePoints.Count < 30)
+                {
+                    // Find boundary pixels of blob
+                    foreach (var (x, y) in candidate.blobPixels)
+                    {
+                        double dist = Math.Sqrt((x - candidate.centerX) * (x - candidate.centerX) + 
+                                            (y - candidate.centerY) * (y - candidate.centerY));
+                        
+                        if (dist > candidate.avgRadius * 0.7) // Outer pixels
+                            edgePoints.Add((x, y));
+                    }
+                }
+                
+                if (edgePoints.Count < 6)
+                {
+                    debugLog.AppendLine($"  Candidate at ({candidate.centerX:F0}, {candidate.centerY:F0}): Too few edge points\n");
+                    continue;
+                }
+                
+                // Fit ellipse to edge points
+                EllipseParams ellipse = fitEllipseToPoints(edgePoints);
+                
+                if (ellipse != null)
+                {
+                    double aspectRatio = ellipse.a / ellipse.b;
+                    
+                    debugLog.AppendLine($"  Ellipse at ({ellipse.cx:F0}, {ellipse.cy:F0}):");
+                    debugLog.AppendLine($"    Semi-axes: {ellipse.a:F1} x {ellipse.b:F1}");
+                    debugLog.AppendLine($"    Aspect ratio: {aspectRatio:F2}");
+                    debugLog.AppendLine($"    Rotation: {(ellipse.theta * 180 / Math.PI):F1}°");
+                    
+                    // Validate aspect ratio (perspective allows 1 to 5)
+                    if (aspectRatio >= 1.0 && aspectRatio <= 5.0)
+                    {
+                        ellipse.inliers = edgePoints.Count;
+                        detectedEllipses.Add(ellipse);
+                        debugLog.AppendLine($"    ✓ VALID\n");
+                    }
+                    else
+                    {
+                        debugLog.AppendLine($"    ✗ Invalid aspect ratio\n");
+                    }
+                }
+            }
+            
+            debugLog.AppendLine($"  → Ellipses fitted: {detectedEllipses.Count}\n");
+            
+            // ========================================
+            // STEP 5: VALIDATE BY TEXTURE (metallic = uniform bright with dark spots)
+            // ========================================
+            debugLog.AppendLine("STEP 5: Texture Validation");
+            
+            List<EllipseParams> validManholes = new List<EllipseParams>();
+            
+            foreach (var ellipse in detectedEllipses)
+            {
+                bool isValid = validateMetallicTexture(smoothed, ellipse, debugLog);
+                
+                if (isValid)
+                {
+                    validManholes.Add(ellipse);
+                    debugLog.AppendLine($"  ✓ VALID metallic manhole at ({ellipse.cx:F0}, {ellipse.cy:F0})\n");
+                }
+                else
+                {
+                    debugLog.AppendLine($"  ✗ Rejected at ({ellipse.cx:F0}, {ellipse.cy:F0})\n");
+                }
+            }
+            
+            // ========================================
+            // STEP 6: SCALE BACK
+            // ========================================
+            if (wasDownscaled && validManholes.Count > 0)
+            {
+                debugLog.AppendLine("STEP 6: Scaling Back");
+                
+                List<EllipseParams> scaled = new List<EllipseParams>();
+                
+                foreach (var ellipse in validManholes)
+                {
+                    scaled.Add(new EllipseParams
+                    {
+                        cx = ellipse.cx / scaleFactor,
+                        cy = ellipse.cy / scaleFactor,
+                        a = ellipse.a / scaleFactor,
+                        b = ellipse.b / scaleFactor,
+                        theta = ellipse.theta,
+                        inliers = ellipse.inliers
+                    });
+                }
+                
+                validManholes = scaled;
+            }
+            
+            debugLog.AppendLine($"\nFINAL: {validManholes.Count} manholes detected\n");
+            
+            // ========================================
+            // STEP 7: DRAW RESULTS
+            // ========================================
+            byte[,,] output = drawEllipsesOnImage(inputImage, validManholes);
+            
+            MessageBox.Show(debugLog.ToString(), "Manhole Detection Results");
             
             return output;
         }
 
         /*
-        * detectCirclesWithGradient: MORE RELAXED voting
+        * ManholeCandidate: Stores properties of a potential manhole blob
         */
-        private List<TrafficSignCandidate> detectCirclesWithGradient(
-            byte[,] originalImage,
-            byte[,] edgeMagnitude,
-            byte[,] binaryEdges,
-            int minRadius,
+        private class ManholeCandidate
+        {
+            public double centerX { get; set; }
+            public double centerY { get; set; }
+            public double avgRadius { get; set; }
+            public double circularity { get; set; }
+            public double elongation { get; set; }
+            public List<(int x, int y)> blobPixels { get; set; }
+        }
+
+        /*
+        * validateMetallicTexture: Check if ellipse interior has metallic appearance
+        * Metallic = bright overall with some dark spots/details
+        */
+        private bool validateMetallicTexture(byte[,] image, EllipseParams ellipse, StringBuilder log)
+        {
+            int h = image.GetLength(0);
+            int w = image.GetLength(1);
+            
+            int cx = (int)ellipse.cx;
+            int cy = (int)ellipse.cy;
+            
+            if (cx < 10 || cx >= w - 10 || cy < 10 || cy >= h - 10)
+                return false;
+            
+            List<byte> interiorPixels = new List<byte>();
+            List<byte> exteriorPixels = new List<byte>();
+            
+            // Sample interior uniformly
+            for (int y = cy - (int)ellipse.b; y <= cy + (int)ellipse.b; y++)
+            {
+                for (int x = cx - (int)ellipse.a; x <= cx + (int)ellipse.a; x++)
+                {
+                    if (x < 0 || x >= w || y < 0 || y >= h) continue;
+                    
+                    // Check if inside ellipse
+                    double dx = x - cx;
+                    double dy = y - cy;
+                    
+                    double cos_theta = Math.Cos(-ellipse.theta);
+                    double sin_theta = Math.Sin(-ellipse.theta);
+                    
+                    double x_rot = dx * cos_theta - dy * sin_theta;
+                    double y_rot = dx * sin_theta + dy * cos_theta;
+                    
+                    double normalized = (x_rot * x_rot) / (ellipse.a * ellipse.a) + 
+                                    (y_rot * y_rot) / (ellipse.b * ellipse.b);
+                    
+                    if (normalized < 0.8) // Interior
+                        interiorPixels.Add(image[y, x]);
+                    else if (normalized > 1.2 && normalized < 1.8) // Exterior ring
+                        exteriorPixels.Add(image[y, x]);
+                }
+            }
+            
+            if (interiorPixels.Count < 50 || exteriorPixels.Count < 30)
+                return false;
+            
+            double avgInt = interiorPixels.Average(v => (double)v);
+            double avgExt = exteriorPixels.Average(v => (double)v);
+            double stdInt = Math.Sqrt(interiorPixels.Average(v => Math.Pow(v - avgInt, 2)));
+            
+            // Count dark spots (texture details)
+            int darkSpots = interiorPixels.Count(v => v < avgInt - 20);
+            double darkSpotRatio = darkSpots / (double)interiorPixels.Count;
+            
+            log.AppendLine($"    Interior avg: {avgInt:F1} (need >120)");
+            log.AppendLine($"    Exterior avg: {avgExt:F1}");
+            log.AppendLine($"    Std dev: {stdInt:F1} (need >10)");
+            log.AppendLine($"    Dark spots: {darkSpotRatio:P1} (need >5%)");
+            
+            // Metallic manholes are:
+            // 1. BRIGHT overall (avg > 120)
+            // 2. BRIGHTER than surroundings
+            // 3. Have texture variation (std > 10)
+            // 4. Have some dark details (>5% dark spots)
+            
+            bool isBright = avgInt > 120;
+            bool brighterThanBackground = avgInt > avgExt + 10;
+            bool hasTexture = stdInt > 10;
+            bool hasDarkDetails = darkSpotRatio > 0.05;
+            
+            bool isMetallic = isBright && brighterThanBackground && hasTexture && hasDarkDetails;
+            
+            log.AppendLine($"    Bright: {isBright}, Contrast: {brighterThanBackground}, " +
+                        $"Texture: {hasTexture}, Details: {hasDarkDetails}");
+            log.AppendLine($"    → Metallic: {isMetallic}");
+            
+            return isMetallic;
+        }
+
+        /*
+        * ransacEllipseDetectionDirect: IMPROVED version with better sampling
+        */
+        private List<EllipseParams> ransacEllipseDetectionDirect(
+            List<(int x, int y)> edgePoints,
+            int minSemiAxis,
+            int maxSemiAxis,
+            int imageWidth,
+            int imageHeight,
+            StringBuilder log)
+        {
+            List<EllipseParams> detectedEllipses = new List<EllipseParams>();
+            
+            if (edgePoints.Count < 6)
+            {
+                log.AppendLine("  ⚠ Not enough edge points");
+                return detectedEllipses;
+            }
+            
+            Random rand = new Random(42);
+            
+            int maxIterations = 2000;      // Increased from 1000
+            double inlierThreshold = 10.0; // More relaxed (was 8.0)
+            int minInliers = 30;           // Reduced from 40
+            
+            log.AppendLine($"  RANSAC parameters:");
+            log.AppendLine($"    Iterations: {maxIterations}");
+            log.AppendLine($"    Inlier threshold: {inlierThreshold} px");
+            log.AppendLine($"    Min inliers: {minInliers}");
+            log.AppendLine($"    Total edge points: {edgePoints.Count}\n");
+            
+            List<(int x, int y)> remainingPoints = new List<(int x, int y)>(edgePoints);
+            
+            // Detect up to 5 ellipses
+            for (int ellipseCount = 0; ellipseCount < 5 && remainingPoints.Count >= minInliers; ellipseCount++)
+            {
+                EllipseParams bestEllipse = null;
+                int bestInlierCount = 0;
+                List<(int x, int y)> bestInliers = null;
+                
+                // RANSAC iterations
+                for (int iter = 0; iter < maxIterations; iter++)
+                {
+                    if (remainingPoints.Count < 6) break;
+                    
+                    // Sample 6 WELL-DISTRIBUTED points
+                    List<(int x, int y)> sample = new List<(int x, int y)>();
+                    HashSet<int> usedIndices = new HashSet<int>();
+                    
+                    // Sample from different regions to avoid local clusters
+                    for (int i = 0; i < 6; i++)
+                    {
+                        int idx = rand.Next(remainingPoints.Count);
+                        int attempts = 0;
+                        
+                        // Ensure points are somewhat separated
+                        while (usedIndices.Contains(idx) && attempts < 20)
+                        {
+                            idx = rand.Next(remainingPoints.Count);
+                            attempts++;
+                        }
+                        
+                        usedIndices.Add(idx);
+                        sample.Add(remainingPoints[idx]);
+                    }
+                    
+                    // Fit ellipse
+                    EllipseParams ellipse = fitEllipseToPoints(sample);
+                    
+                    if (ellipse == null) continue;
+                    
+                    // RELAXED validation
+                    if (ellipse.a < minSemiAxis || ellipse.a > maxSemiAxis ||
+                        ellipse.b < minSemiAxis || ellipse.b > maxSemiAxis)
+                        continue;
+                    
+                    // Aspect ratio: 1.0 to 4.5 (more permissive)
+                    double aspectRatio = ellipse.a / ellipse.b;
+                    if (aspectRatio < 1.0 || aspectRatio > 4.5)
+                        continue;
+                    
+                    // Check bounds
+                    if (ellipse.cx < 0 || ellipse.cx >= imageWidth ||
+                        ellipse.cy < 0 || ellipse.cy >= imageHeight)
+                        continue;
+                    
+                    // Count inliers
+                    List<(int x, int y)> inliers = new List<(int x, int y)>();
+                    foreach (var point in remainingPoints)
+                    {
+                        double dist = distancePointToEllipse(point.x, point.y, ellipse);
+                        if (dist < inlierThreshold)
+                            inliers.Add(point);
+                    }
+                    
+                    // Update best
+                    if (inliers.Count > bestInlierCount)
+                    {
+                        bestInlierCount = inliers.Count;
+                        bestEllipse = ellipse;
+                        bestInliers = inliers;
+                    }
+                }
+                
+                // Accept ellipse if found
+                if (bestEllipse != null && bestInlierCount >= minInliers)
+                {
+                    bestEllipse.inliers = bestInlierCount;
+                    detectedEllipses.Add(bestEllipse);
+                    
+                    double aspectRatio = bestEllipse.a / bestEllipse.b;
+                    
+                    log.AppendLine($"  Ellipse {ellipseCount + 1}:");
+                    log.AppendLine($"    Center: ({bestEllipse.cx:F0}, {bestEllipse.cy:F0})");
+                    log.AppendLine($"    Semi-axes: {bestEllipse.a:F0} x {bestEllipse.b:F0}");
+                    log.AppendLine($"    Aspect ratio: {aspectRatio:F2}");
+                    log.AppendLine($"    Inliers: {bestInlierCount} ({(bestInlierCount * 100.0 / edgePoints.Count):F1}%)");
+                    log.AppendLine($"    Rotation: {(bestEllipse.theta * 180 / Math.PI):F1}°\n");
+                    
+                    // Remove inliers
+                    foreach (var inlier in bestInliers)
+                        remainingPoints.Remove(inlier);
+                }
+                else
+                {
+                    break;
+                }
+            }
+            
+            return detectedEllipses;
+        }
+
+        /*
+        * validateManholeIntensityRelaxed: RELAXED intensity validation
+        */
+        private bool validateManholeIntensityRelaxed(byte[,] image, EllipseParams ellipse, StringBuilder log)
+        {
+            int h = image.GetLength(0);
+            int w = image.GetLength(1);
+            
+            int cx = (int)ellipse.cx;
+            int cy = (int)ellipse.cy;
+            
+            // Bounds check
+            if (cx < 10 || cx >= w - 10 || cy < 10 || cy >= h - 10)
+            {
+                log.AppendLine($"    Out of bounds");
+                return false;
+            }
+            
+            List<byte> interior = new List<byte>();
+            List<byte> exterior = new List<byte>();
+            
+            Random rand = new Random(42);
+            
+            // Sample 150 points (was 100)
+            for (int i = 0; i < 150; i++)
+            {
+                double angle = rand.NextDouble() * 2 * Math.PI;
+                
+                // Interior (60% radius, was 50%)
+                double r = rand.NextDouble() * 0.6;
+                int x = cx + (int)(ellipse.a * r * Math.Cos(angle) * Math.Cos(ellipse.theta) -
+                                ellipse.b * r * Math.Sin(angle) * Math.Sin(ellipse.theta));
+                int y = cy + (int)(ellipse.a * r * Math.Cos(angle) * Math.Sin(ellipse.theta) +
+                                ellipse.b * r * Math.Sin(angle) * Math.Cos(ellipse.theta));
+                
+                if (x >= 0 && x < w && y >= 0 && y < h)
+                    interior.Add(image[y, x]);
+                
+                // Exterior (110%-140% radius)
+                r = 1.1 + rand.NextDouble() * 0.3;
+                x = cx + (int)(ellipse.a * r * Math.Cos(angle) * Math.Cos(ellipse.theta) -
+                            ellipse.b * r * Math.Sin(angle) * Math.Sin(ellipse.theta));
+                y = cy + (int)(ellipse.a * r * Math.Cos(angle) * Math.Sin(ellipse.theta) +
+                            ellipse.b * r * Math.Sin(angle) * Math.Cos(ellipse.theta));
+                
+                if (x >= 0 && x < w && y >= 0 && y < h)
+                    exterior.Add(image[y, x]);
+            }
+            
+            if (interior.Count < 20 || exterior.Count < 20)
+            {
+                log.AppendLine($"    Insufficient samples");
+                return false;
+            }
+            
+            double avgInt = interior.Average(v => (double)v);
+            double avgExt = exterior.Average(v => (double)v);
+            double stdInt = Math.Sqrt(interior.Average(v => Math.Pow(v - avgInt, 2)));
+            
+            log.AppendLine($"    Interior avg: {avgInt:F1}, Exterior avg: {avgExt:F1}");
+            log.AppendLine($"    Interior std: {stdInt:F1}");
+            
+            // VERY RELAXED criteria
+            double contrast = Math.Abs(avgInt - avgExt);
+            bool hasContrast = contrast > 5;     // Was 10
+            bool hasTexture = stdInt > 3;         // Was 5
+            
+            // Accept if EITHER has contrast OR has texture (was AND)
+            bool valid = hasContrast || hasTexture;
+            
+            log.AppendLine($"    Contrast: {contrast:F1} (need >5), Has: {hasContrast}");
+            log.AppendLine($"    Texture: {stdInt:F1} (need >3), Has: {hasTexture}");
+            log.AppendLine($"    Valid: {valid}");
+            
+            return valid;
+        }
+
+        /*
+        * distancePointToEllipse: Calculate distance from point to ellipse
+        */
+        private double distancePointToEllipse(double px, double py, EllipseParams ellipse)
+        {
+            // Transform to ellipse coordinate system
+            double dx = px - ellipse.cx;
+            double dy = py - ellipse.cy;
+            
+            double cos_theta = Math.Cos(-ellipse.theta);
+            double sin_theta = Math.Sin(-ellipse.theta);
+            
+            double x_rot = dx * cos_theta - dy * sin_theta;
+            double y_rot = dx * sin_theta + dy * cos_theta;
+            
+            // Normalized distance
+            double normalized = (x_rot * x_rot) / (ellipse.a * ellipse.a) + 
+                            (y_rot * y_rot) / (ellipse.b * ellipse.b);
+            
+            return Math.Abs(Math.Sqrt(normalized) - 1.0) * Math.Min(ellipse.a, ellipse.b);
+        }
+
+        /*
+        * detectCirclesByHough: Simplified Hough-like circle detection
+        */
+        private List<(int cx, int cy, double radius)> detectCirclesByHough(
+            byte[,] edges, 
+            int minY, 
+            int minRadius, 
             int maxRadius,
             StringBuilder log)
         {
-            int h = originalImage.GetLength(0);
-            int w = originalImage.GetLength(1);
+            int h = edges.GetLength(0);
+            int w = edges.GetLength(1);
             
-            List<TrafficSignCandidate> circles = new List<TrafficSignCandidate>();
+            List<(int cx, int cy, double radius)> circles = new List<(int, int, double)>();
             
-            minRadius = Math.Max(40, minRadius);
-            if (maxRadius < minRadius + 30)
-                maxRadius = minRadius + 60;
+            // Test multiple radii
+            int[] testRadii = new int[5];
+            for (int i = 0; i < 5; i++)
+                testRadii[i] = minRadius + (maxRadius - minRadius) * i / 4;
             
-            log.AppendLine($"    RELAXED CIRCLE DETECTION");
-            log.AppendLine($"    Radius range: {minRadius} - {maxRadius} px\n");
+            log.AppendLine($"  Testing radii: {string.Join(", ", testRadii)}");
             
-            int radiusStep = Math.Max(5, (maxRadius - minRadius) / 10);
-            
-            for (int radius = minRadius; radius <= maxRadius; radius += radiusStep)
+            foreach (int radius in testRadii)
             {
-                log.AppendLine($"    Testing radius {radius}px...");
+                int[,] votes = new int[h, w];
                 
-                int[,] accumulator = new int[h, w];
-                
-                // Vote for ALL possible centers
-                int edgePixelCount = 0;
-                for (int y = 0; y < h; y++)
+                // Vote for circle centers
+                for (int y = minY; y < h; y++)
                 {
                     for (int x = 0; x < w; x++)
                     {
-                        if (binaryEdges[y, x] == 0) continue;
+                        if (edges[y, x] == 0) continue;
                         
-                        edgePixelCount++;
-                        
-                        // Vote every 10 degrees
+                        // Vote in circle around this edge point
                         for (int angle = 0; angle < 360; angle += 10)
                         {
                             double rad = angle * Math.PI / 180.0;
                             int cx = x + (int)(radius * Math.Cos(rad));
                             int cy = y + (int)(radius * Math.Sin(rad));
                             
-                            if (cx >= 10 && cx < w - 10 && cy >= 10 && cy < h - 10)
-                            {
-                                accumulator[cy, cx]++;
-                            }
+                            if (cy >= minY && cy < h && cx >= 0 && cx < w)
+                                votes[cy, cx]++;
                         }
                     }
                 }
                 
-                log.AppendLine($"      Edge pixels: {edgePixelCount}");
-                
-                if (edgePixelCount < 50)
-                {
-                    log.AppendLine($"      Skipping - too few edges");
-                    continue;
-                }
-                
-                // Find max votes
+                // Find peaks
                 int maxVotes = 0;
-                for (int y = 0; y < h; y++)
+                for (int y = minY; y < h; y++)
                     for (int x = 0; x < w; x++)
-                        if (accumulator[y, x] > maxVotes)
-                            maxVotes = accumulator[y, x];
+                        if (votes[y, x] > maxVotes)
+                            maxVotes = votes[y, x];
                 
-                log.AppendLine($"      Max votes: {maxVotes}");
+                int threshold = Math.Max(maxVotes / 3, 30);
                 
-                // MUCH MORE RELAXED threshold - only need 30% of maximum possible
-                int angleStep = 10;
-                int maxPossibleVotes = 360 / angleStep; // 36 votes
-                int threshold = (int)(maxPossibleVotes * 0.30); // 30% = ~11 votes
+                log.AppendLine($"    r={radius}: max votes={maxVotes}, threshold={threshold}");
                 
-                log.AppendLine($"      Threshold: {threshold} votes (30% of {maxPossibleVotes})");
-                
-                int candidatesFound = 0;
-                
-                // Find local maxima
-                for (int y = 20; y < h - 20; y++)
+                // Extract peaks
+                for (int y = minY + 10; y < h - 10; y++)
                 {
-                    for (int x = 20; x < w - 20; x++)
+                    for (int x = 10; x < w - 10; x++)
                     {
-                        if (accumulator[y, x] < threshold) continue;
+                        if (votes[y, x] < threshold) continue;
                         
-                        // Check if local maximum in 15px window
+                        // Check local maximum
                         bool isMax = true;
-                        for (int dy = -15; dy <= 15 && isMax; dy++)
+                        for (int dy = -10; dy <= 10 && isMax; dy++)
+                            for (int dx = -10; dx <= 10 && isMax; dx++)
+                                if (votes[y + dy, x + dx] > votes[y, x])
+                                    isMax = false;
+                        
+                        if (isMax)
                         {
-                            for (int dx = -15; dx <= 15 && isMax; dx++)
-                            {
-                                int ny = y + dy;
-                                int nx = x + dx;
-                                if (ny >= 0 && ny < h && nx >= 0 && nx < w)
-                                {
-                                    if (accumulator[ny, nx] > accumulator[y, x])
-                                        isMax = false;
-                                }
-                            }
-                        }
-                        
-                        if (!isMax) continue;
-                        
-                        // Validate perimeter
-                        double compactness = validateCirclePerimeter(binaryEdges, x, y, radius);
-                        double confidence = accumulator[y, x] / (double)maxPossibleVotes;
-                        
-                        log.AppendLine($"      Candidate ({x},{y}): votes={accumulator[y,x]}, compact={compactness:F2}, conf={confidence:F2}");
-                        
-                        // VERY RELAXED thresholds: 25% compactness, 10% confidence
-                        if (compactness > 0.25 && confidence > 0.10)
-                        {
-                            circles.Add(new TrafficSignCandidate
-                            {
-                                Type = "Circle",
-                                CenterX = x,
-                                CenterY = y,
-                                Radius = radius,
-                                Confidence = confidence,
-                                Compactness = compactness,
-                                Area = (int)(Math.PI * radius * radius)
-                            });
-                            
-                            candidatesFound++;
-                            log.AppendLine($"        ✓ ACCEPTED (compact={compactness:F2}, conf={confidence:F2})");
-                            
-                            if (circles.Count >= 50) goto ExitSearch;
-                        }
-                        else
-                        {
-                            log.AppendLine($"        ✗ Rejected (compact={compactness:F2}, conf={confidence:F2})");
+                            circles.Add((x, y, radius));
+                            log.AppendLine($"      Peak at ({x}, {y})");
                         }
                     }
                 }
-                
-                log.AppendLine($"      → {candidatesFound} candidates at radius {radius}\n");
             }
             
-            ExitSearch:
+            // Remove duplicates (circles too close)
+            List<(int cx, int cy, double radius)> filtered = new List<(int, int, double)>();
             
-            log.AppendLine($"    Total candidates: {circles.Count}");
-            
-            if (circles.Count == 0)
+            foreach (var circle in circles.OrderByDescending(c => c.radius))
             {
-                log.AppendLine($"\n    ⚠ WARNING: NO CIRCLES DETECTED!");
-                log.AppendLine($"    Edges look good in combined_edges.png");
-                log.AppendLine($"    Try reducing minRadius or increasing angle sampling");
-            }
-            
-            // Merge similar circles
-            circles = mergeSimilarCirclesStrict(circles, log);
-            
-            // Keep top 20 by confidence
-            circles = circles.OrderByDescending(c => c.Confidence)
-                            .ThenByDescending(c => c.Compactness)
-                            .Take(20)
-                            .ToList();
-            
-            log.AppendLine($"    FINAL: {circles.Count} circles\n");
-            
-            return circles;
-        }
-
-        /*
-        * validateCirclePerimeter: Check what percentage of the circle perimeter has edges
-        */
-        private double validateCirclePerimeter(byte[,] edgeImage, int cx, int cy, int radius)
-        {
-            int h = edgeImage.GetLength(0);
-            int w = edgeImage.GetLength(1);
-            
-            int edgeCount = 0;
-            int totalSamples = 0;
-            
-            // Sample every 3 degrees around perimeter
-            for (int angle = 0; angle < 360; angle += 3)
-            {
-                double rad = angle * Math.PI / 180.0;
+                bool tooClose = false;
                 
-                // Check in a small window (±3 pixels) around expected position
-                bool foundEdge = false;
-                for (int dr = -3; dr <= 3 && !foundEdge; dr++)
+                foreach (var existing in filtered)
                 {
-                    int r = radius + dr;
-                    int x = cx + (int)(r * Math.Cos(rad));
-                    int y = cy + (int)(r * Math.Sin(rad));
+                    double dist = Math.Sqrt((circle.cx - existing.cx) * (circle.cx - existing.cx) +
+                                        (circle.cy - existing.cy) * (circle.cy - existing.cy));
                     
-                    if (x >= 0 && x < w && y >= 0 && y < h && edgeImage[y, x] > 0)
-                        foundEdge = true;
-                }
-                
-                totalSamples++;
-                if (foundEdge) edgeCount++;
-            }
-            
-            return totalSamples > 0 ? edgeCount / (double)totalSamples : 0;
-        }
-
-        /*
-        * validateCircleCompactnessRelaxed: Relaxed validation
-        */
-        private double validateCircleCompactnessRelaxed(byte[,] edgeImage, int cx, int cy, int radius)
-        {
-            int h = edgeImage.GetLength(0);
-            int w = edgeImage.GetLength(1);
-            
-            int edgeCount = 0;
-            int totalSamples = 0;
-            
-            // Sample every 2 degrees (180 samples instead of 360)
-            for (int angle = 0; angle < 360; angle += 2)
-            {
-                double rad = angle * Math.PI / 180.0;
-                
-                bool foundEdge = false;
-                for (int dr = -3; dr <= 3 && !foundEdge; dr++) // Wider search window
-                {
-                    int r = radius + dr;
-                    int x = cx + (int)(r * Math.Cos(rad));
-                    int y = cy + (int)(r * Math.Sin(rad));
-                    
-                    if (x >= 0 && x < w && y >= 0 && y < h)
+                    if (dist < minRadius)
                     {
-                        if (edgeImage[y, x] > 0)
-                            foundEdge = true;
+                        tooClose = true;
+                        break;
                     }
                 }
                 
-                totalSamples++;
-                if (foundEdge)
-                    edgeCount++;
+                if (!tooClose)
+                    filtered.Add(circle);
             }
             
-            return totalSamples > 0 ? edgeCount / (double)totalSamples : 0;
+            return filtered.Take(5).ToList();
         }
 
         /*
-        * filterTrafficSignsRelaxed: RELAXED filtering
+        * EllipseParams: Ellipse parameters
         */
-        private List<TrafficSignCandidate> filterTrafficSignsRelaxed(
-            List<TrafficSignCandidate> candidates,
-            int imageWidth,
-            int imageHeight,
-            double scaleRatio,
-            int minArea,
-            int maxArea,
-            StringBuilder log)
+        private class EllipseParams
         {
-            List<TrafficSignCandidate> valid = new List<TrafficSignCandidate>();
-            
-            int rejected = 0;
-            Dictionary<string, int> rejectionReasons = new Dictionary<string, int>
-            {
-                {"position", 0},
-                {"size", 0},
-                {"compactness", 0},
-                {"confidence", 0}
-            };
-            
-            int actualMinArea = Math.Max(minArea, 500); // Reduced from 800
-            
-            foreach (var sign in candidates)
-            {
-                // Filter 1: Position (upper 80% instead of 70%)
-                if (sign.CenterY > imageHeight * 0.80)
-                {
-                    rejected++;
-                    rejectionReasons["position"]++;
-                    continue;
-                }
-                
-                // Filter 2: Size
-                if (sign.Area < actualMinArea || sign.Area > maxArea)
-                {
-                    rejected++;
-                    rejectionReasons["size"]++;
-                    continue;
-                }
-                
-                // Filter 3: Compactness - RELAXED to 0.55
-                if (sign.Compactness < 0.55)
-                {
-                    rejected++;
-                    rejectionReasons["compactness"]++;
-                    continue;
-                }
-                
-                // Filter 4: Confidence - RELAXED to 0.45
-                if (sign.Confidence < 0.45)
-                {
-                    rejected++;
-                    rejectionReasons["confidence"]++;
-                    continue;
-                }
-                
-                valid.Add(sign);
-            }
-            
-            log.AppendLine($"  Total candidates: {candidates.Count}");
-            log.AppendLine($"  Rejected: {rejected}");
-            log.AppendLine($"    - By position: {rejectionReasons["position"]}");
-            log.AppendLine($"    - By size: {rejectionReasons["size"]}");
-            log.AppendLine($"    - By compactness: {rejectionReasons["compactness"]}");
-            log.AppendLine($"    - By confidence: {rejectionReasons["confidence"]}");
-            log.AppendLine($"  Filters applied (RELAXED):");
-            log.AppendLine($"    - Position: y < 80% height");
-            log.AppendLine($"    - Size: {actualMinArea} < area < {maxArea} px²");
-            log.AppendLine($"    - Compactness: > 0.55");
-            log.AppendLine($"    - Confidence: > 0.45");
-            
-            return valid;
+            public double cx { get; set; }
+            public double cy { get; set; }
+            public double a { get; set; }
+            public double b { get; set; }
+            public double theta { get; set; }
+            public int inliers { get; set; }
         }
 
         /*
-        * saveDebugImage: Save intermediate images for debugging
+        * fitEllipseToPoints: Fit ellipse using moment-based method
         */
-        private void saveDebugImage(byte[,] image, string filename)
+        private EllipseParams fitEllipseToPoints(List<(int x, int y)> points)
         {
+            if (points.Count < 6) return null;
+            
             try
             {
-                int h = image.GetLength(0);
-                int w = image.GetLength(1);
+                double mx = points.Average(p => (double)p.x);
+                double my = points.Average(p => (double)p.y);
                 
-                Bitmap bmp = new Bitmap(w, h);
-                for (int y = 0; y < h; y++)
+                double m20 = 0, m02 = 0, m11 = 0;
+                
+                foreach (var (x, y) in points)
                 {
-                    for (int x = 0; x < w; x++)
-                    {
-                        byte val = image[y, x];
-                        bmp.SetPixel(x, y, Color.FromArgb(val, val, val));
-                    }
+                    double dx = x - mx;
+                    double dy = y - my;
+                    m20 += dx * dx;
+                    m02 += dy * dy;
+                    m11 += dx * dy;
                 }
                 
-                string path = Path.Combine(Path.GetTempPath(), filename);
-                bmp.Save(path);
-                bmp.Dispose();
+                m20 /= points.Count;
+                m02 /= points.Count;
+                m11 /= points.Count;
+                
+                // Eigenvalues
+                double term = Math.Sqrt(Math.Max(0, 4 * m11 * m11 + (m20 - m02) * (m20 - m02)));
+                double lambda1 = (m20 + m02 + term) / 2;
+                double lambda2 = (m20 + m02 - term) / 2;
+                
+                if (lambda1 <= 0 || lambda2 <= 0) return null;
+                
+                double a = 2 * Math.Sqrt(lambda1);
+                double b = 2 * Math.Sqrt(lambda2);
+                
+                double theta = 0;
+                if (Math.Abs(m11) > 0.001 || Math.Abs(m20 - m02) > 0.001)
+                    theta = 0.5 * Math.Atan2(2 * m11, m20 - m02);
+                
+                return new EllipseParams
+                {
+                    cx = mx,
+                    cy = my,
+                    a = a,
+                    b = b,
+                    theta = theta,
+                    inliers = 0
+                };
             }
             catch
             {
-                // Ignore save errors
+                return null;
             }
         }
 
         /*
-        * validateCircleCompactnessStrict: MUCH stricter circle validation
-        * Samples MORE points and requires MUCH higher edge coverage
+        * validateManholeIntensity: Check if ellipse has manhole-like intensity pattern
         */
-        private double validateCircleCompactnessStrict(byte[,] edgeImage, int cx, int cy, int radius)
-        {
-            int h = edgeImage.GetLength(0);
-            int w = edgeImage.GetLength(1);
-            
-            int edgeCount = 0;
-            int totalSamples = 0;
-            
-            // Sample EVERY DEGREE around the circle perimeter (360 samples)
-            for (int angle = 0; angle < 360; angle += 1) // Every degree!
-            {
-                double rad = angle * Math.PI / 180.0;
-                
-                // Check in a SMALL window around expected circle position (±2 pixels)
-                bool foundEdge = false;
-                for (int dr = -2; dr <= 2 && !foundEdge; dr++)
-                {
-                    int r = radius + dr;
-                    int x = cx + (int)(r * Math.Cos(rad));
-                    int y = cy + (int)(r * Math.Sin(rad));
-                    
-                    if (x >= 0 && x < w && y >= 0 && y < h)
-                    {
-                        if (edgeImage[y, x] > 0)
-                            foundEdge = true;
-                    }
-                }
-                
-                totalSamples++;
-                if (foundEdge)
-                    edgeCount++;
-            }
-            
-            return totalSamples > 0 ? edgeCount / (double)totalSamples : 0;
-        }
-
-        /*
-        * countEdgePixelsInCircle: Count how many edge pixels are within the circular region
-        */
-        private int countEdgePixelsInCircle(byte[,] edgeImage, int cx, int cy, int radius)
-        {
-            int h = edgeImage.GetLength(0);
-            int w = edgeImage.GetLength(1);
-            
-            int count = 0;
-            int radiusSquared = radius * radius;
-            
-            // Check all pixels in bounding box
-            int minX = Math.Max(0, cx - radius - 3);
-            int maxX = Math.Min(w - 1, cx + radius + 3);
-            int minY = Math.Max(0, cy - radius - 3);
-            int maxY = Math.Min(h - 1, cy + radius + 3);
-            
-            for (int y = minY; y <= maxY; y++)
-            {
-                for (int x = minX; x <= maxX; x++)
-                {
-                    int dx = x - cx;
-                    int dy = y - cy;
-                    int distSquared = dx * dx + dy * dy;
-                    
-                    // Check if pixel is near the circle perimeter (±3 pixels)
-                    int innerRadiusSquared = (radius - 3) * (radius - 3);
-                    int outerRadiusSquared = (radius + 3) * (radius + 3);
-                    
-                    if (distSquared >= innerRadiusSquared && distSquared <= outerRadiusSquared)
-                    {
-                        if (edgeImage[y, x] > 0)
-                            count++;
-                    }
-                }
-            }
-            
-            return count;
-        }
-
-        /*
-        * mergeSimilarCirclesStrict: Merge circles with STRICTER distance threshold
-        */
-        private List<TrafficSignCandidate> mergeSimilarCirclesStrict(
-            List<TrafficSignCandidate> circles,
-            StringBuilder log)
-        {
-            List<TrafficSignCandidate> merged = new List<TrafficSignCandidate>();
-            bool[] used = new bool[circles.Count];
-            
-            for (int i = 0; i < circles.Count; i++)
-            {
-                if (used[i]) continue;
-                
-                var best = circles[i];
-                used[i] = true;
-                
-                // Find similar circles and keep the best one
-                for (int j = i + 1; j < circles.Count; j++)
-                {
-                    if (used[j]) continue;
-                    
-                    double dist = Math.Sqrt(
-                        Math.Pow(circles[i].CenterX - circles[j].CenterX, 2) +
-                        Math.Pow(circles[i].CenterY - circles[j].CenterY, 2));
-                    
-                    double avgRadius = (circles[i].Radius + circles[j].Radius) / 2.0;
-                    double radiusDiff = Math.Abs(circles[i].Radius - circles[j].Radius);
-                    
-                    // Same circle if centers very close (within radius) and radii similar
-                    if (dist < avgRadius * 0.5 && radiusDiff < avgRadius * 0.3)
-                    {
-                        used[j] = true;
-                        // Keep the one with better compactness
-                        if (circles[j].Compactness > best.Compactness)
-                            best = circles[j];
-                    }
-                }
-                
-                merged.Add(best);
-            }
-            
-            if (merged.Count < circles.Count)
-                log.AppendLine($"    Merged {circles.Count} → {merged.Count} circles");
-            
-            return merged;
-        }
-
-        /*
-        * filterTrafficSignsScaled: Apply validation filters with scaled parameters
-        */
-        private List<TrafficSignCandidate> filterTrafficSignsScaled(
-            List<TrafficSignCandidate> candidates,
-            int imageWidth,
-            int imageHeight,
-            double scaleRatio,
-            int minArea,
-            int maxArea,
-            StringBuilder log)
-        {
-            List<TrafficSignCandidate> valid = new List<TrafficSignCandidate>();
-            
-            int rejected = 0;
-            Dictionary<string, int> rejectionReasons = new Dictionary<string, int>
-            {
-                {"position", 0},
-                {"size", 0},
-                {"compactness", 0},
-                {"confidence", 0}
-            };
-            
-            // Calculate actual minimum area (defined at the start so it's in scope for logging)
-            int actualMinArea = Math.Max(minArea, 800); // At least 800 px² (was 500)
-            
-            foreach (var sign in candidates)
-            {
-                // Filter 1: Position (upper 70% of image)
-                if (sign.CenterY > imageHeight * 0.7)
-                {
-                    rejected++;
-                    rejectionReasons["position"]++;
-                    continue;
-                }
-                
-                // Filter 2: Size (scaled) - MUCH stricter minimum
-                if (sign.Area < actualMinArea || sign.Area > maxArea)
-                {
-                    rejected++;
-                    rejectionReasons["size"]++;
-                    continue;
-                }
-                
-                // Filter 3: Compactness - EVEN STRICTER
-                if (sign.Compactness < 0.75) // Was 0.7, now 0.75
-                {
-                    rejected++;
-                    rejectionReasons["compactness"]++;
-                    continue;
-                }
-                
-                // Filter 4: Confidence - EVEN STRICTER
-                if (sign.Confidence < 0.60) // Was 0.5, now 0.60
-                {
-                    rejected++;
-                    rejectionReasons["confidence"]++;
-                    continue;
-                }
-                
-                valid.Add(sign);
-            }
-            
-            log.AppendLine($"  Total candidates: {candidates.Count}");
-            log.AppendLine($"  Rejected: {rejected}");
-            log.AppendLine($"    - By position: {rejectionReasons["position"]}");
-            log.AppendLine($"    - By size: {rejectionReasons["size"]}");
-            log.AppendLine($"    - By compactness: {rejectionReasons["compactness"]}");
-            log.AppendLine($"    - By confidence: {rejectionReasons["confidence"]}");
-            log.AppendLine($"  Filters applied:");
-            log.AppendLine($"    - Position: y < 70% height");
-            log.AppendLine($"    - Size: {actualMinArea} < area < {maxArea} px² (scaled)");
-            log.AppendLine($"    - Compactness: > 0.75 (VERY STRICT)");
-            log.AppendLine($"    - Confidence: > 0.60 (VERY STRICT)");
-            
-            return valid;
-        }
-
-        /*
-        * calculateAdaptiveThreshold: Calculate threshold based on percentile
-        * Input:   image - grayscale image
-        *          topPercentile - keep top X% (e.g., 0.20 for top 20%)
-        * Output:  threshold value
-        */
-        private byte calculateAdaptiveThreshold(byte[,] image, double topPercentile)
+        private bool validateManholeIntensity(byte[,] image, EllipseParams ellipse, StringBuilder log)
         {
             int h = image.GetLength(0);
             int w = image.GetLength(1);
             
-            int[] histogram = new int[256];
-            for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++)
-                    histogram[image[y, x]]++;
+            int cx = (int)ellipse.cx;
+            int cy = (int)ellipse.cy;
             
-            int totalPixels = h * w;
-            int targetPixels = (int)(totalPixels * topPercentile);
+            if (cx < 10 || cx >= w - 10 || cy < 10 || cy >= h - 10)
+                return false;
             
-            int cumSum = 0;
-            for (int i = 255; i >= 0; i--)
+            List<byte> interior = new List<byte>();
+            List<byte> exterior = new List<byte>();
+            
+            Random rand = new Random(42);
+            
+            // Sample 100 random points inside and outside
+            for (int i = 0; i < 100; i++)
             {
-                cumSum += histogram[i];
-                if (cumSum >= targetPixels)
-                    return (byte)i;
+                double angle = rand.NextDouble() * 2 * Math.PI;
+                
+                // Interior (50% radius)
+                double r = rand.NextDouble() * 0.5;
+                int x = cx + (int)(ellipse.a * r * Math.Cos(angle) * Math.Cos(ellipse.theta) -
+                                ellipse.b * r * Math.Sin(angle) * Math.Sin(ellipse.theta));
+                int y = cy + (int)(ellipse.a * r * Math.Cos(angle) * Math.Sin(ellipse.theta) +
+                                ellipse.b * r * Math.Sin(angle) * Math.Cos(ellipse.theta));
+                
+                if (x >= 0 && x < w && y >= 0 && y < h)
+                    interior.Add(image[y, x]);
+                
+                // Exterior (120%-150% radius)
+                r = 1.2 + rand.NextDouble() * 0.3;
+                x = cx + (int)(ellipse.a * r * Math.Cos(angle) * Math.Cos(ellipse.theta) -
+                            ellipse.b * r * Math.Sin(angle) * Math.Sin(ellipse.theta));
+                y = cy + (int)(ellipse.a * r * Math.Cos(angle) * Math.Sin(ellipse.theta) +
+                            ellipse.b * r * Math.Sin(angle) * Math.Cos(ellipse.theta));
+                
+                if (x >= 0 && x < w && y >= 0 && y < h)
+                    exterior.Add(image[y, x]);
             }
             
-            return 60; // Fallback
-        }
-
-
-        /*
-        * validateCircleCompactness: Check how circular a detected circle is
-        */
-        private double validateCircleCompactness(byte[,] edgeImage, int cx, int cy, int radius)
-        {
-            int h = edgeImage.GetLength(0);
-            int w = edgeImage.GetLength(1);
+            if (interior.Count < 20 || exterior.Count < 20)
+                return false;
             
-            int edgeCount = 0;
-            int totalSamples = 0;
+            double avgInt = interior.Average(v => (double)v);
+            double avgExt = exterior.Average(v => (double)v);
+            double stdInt = Math.Sqrt(interior.Average(v => Math.Pow(v - avgInt, 2)));
             
-            // Sample around the circle perimeter
-            for (int angle = 0; angle < 360; angle += 2)
-            {
-                double rad = angle * Math.PI / 180.0;
-                
-                // Check in a small window around expected circle position
-                for (int dr = -3; dr <= 3; dr++)
-                {
-                    int r = radius + dr;
-                    int x = cx + (int)(r * Math.Cos(rad));
-                    int y = cy + (int)(r * Math.Sin(rad));
-                    
-                    if (x >= 0 && x < w && y >= 0 && y < h)
-                    {
-                        totalSamples++;
-                        if (edgeImage[y, x] > 0)
-                            edgeCount++;
-                    }
-                }
-            }
+            log.AppendLine($"    Interior: {avgInt:F1}, Exterior: {avgExt:F1}, Std: {stdInt:F1}");
             
-            return totalSamples > 0 ? edgeCount / (double)totalSamples : 0;
+            // Manholes have contrast and texture
+            double contrast = Math.Abs(avgInt - avgExt);
+            bool hasContrast = contrast > 10;
+            bool hasTexture = stdInt > 5;
+            
+            return hasContrast && hasTexture;
         }
 
         /*
-        * mergeSimilarCircles: Remove duplicate detections
+        * drawEllipsesOnImage: Draw THICK RED ellipses with GREEN centers
         */
-        private List<TrafficSignCandidate> mergeSimilarCircles(
-            List<TrafficSignCandidate> circles,
-            StringBuilder log)
-        {
-            List<TrafficSignCandidate> merged = new List<TrafficSignCandidate>();
-            bool[] used = new bool[circles.Count];
-            
-            for (int i = 0; i < circles.Count; i++)
-            {
-                if (used[i]) continue;
-                
-                var best = circles[i];
-                used[i] = true;
-                
-                // Find similar circles and keep the best one
-                for (int j = i + 1; j < circles.Count; j++)
-                {
-                    if (used[j]) continue;
-                    
-                    double dist = Math.Sqrt(
-                        Math.Pow(circles[i].CenterX - circles[j].CenterX, 2) +
-                        Math.Pow(circles[i].CenterY - circles[j].CenterY, 2));
-                    
-                    double radiusDiff = Math.Abs(circles[i].Radius - circles[j].Radius);
-                    
-                    // Same circle if centers close and radii similar
-                    if (dist < 20 && radiusDiff < 10)
-                    {
-                        used[j] = true;
-                        if (circles[j].Confidence > best.Confidence)
-                            best = circles[j];
-                    }
-                }
-                
-                merged.Add(best);
-            }
-            
-            log.AppendLine($"    Merged {circles.Count} → {merged.Count} circles");
-            return merged;
-        }
-
-        /*
-        * detectTriangularSigns: Detect triangular traffic signs
-        */
-        private List<TrafficSignCandidate> detectTriangularSigns(
-            byte[,] edgeImage,
-            StringBuilder log)
-        {
-            int h = edgeImage.GetLength(0);
-            int w = edgeImage.GetLength(1);
-            
-            List<TrafficSignCandidate> triangles = new List<TrafficSignCandidate>();
-            
-            // Region labeling
-            int regionCount;
-            byte[,] labels = sequentialRegionLabeling(edgeImage, out regionCount);
-            
-            log.AppendLine($"    Found {regionCount} regions");
-            
-            // Analyze each region
-            for (byte label = 2; label < regionCount + 2 && label < 255; label++)
-            {
-                // Extract region pixels
-                List<(int x, int y)> pixels = new List<(int x, int y)>();
-                
-                for (int y = 0; y < h; y++)
-                    for (int x = 0; x < w; x++)
-                        if (labels[y, x] == label)
-                            pixels.Add((x, y));
-                
-                if (pixels.Count < 100 || pixels.Count > 10000) continue;
-                
-                // Calculate bounding box
-                int minX = pixels.Min(p => p.x);
-                int maxX = pixels.Max(p => p.x);
-                int minY = pixels.Min(p => p.y);
-                int maxY = pixels.Max(p => p.y);
-                
-                int width = maxX - minX + 1;
-                int height = maxY - minY + 1;
-                double aspectRatio = (double)width / height;
-                
-                // Triangles should have aspect ratio near 1.0
-                if (aspectRatio < 0.7 || aspectRatio > 1.4) continue;
-                
-                // Detect corners using Douglas-Peucker or simple angle detection
-                var corners = detectCorners(pixels);
-                
-                if (corners.Count >= 3 && corners.Count <= 4)
-                {
-                    // Calculate compactness
-                    int area = pixels.Count;
-                    int perimeter = calculatePerimeter(pixels, labels, label, h, w);
-                    double compactness = (4 * Math.PI * area) / Math.Max(perimeter * perimeter, 1);
-                    
-                    if (compactness > 0.3)
-                    {
-                        triangles.Add(new TrafficSignCandidate
-                                        {
-                            Type = "Triangle",
-                            CenterX = (int)pixels.Average(p => p.x),
-                            CenterY = (int)pixels.Average(p => p.y),
-                            Corners = corners.Take(3).ToList(),
-                            Confidence = compactness,
-                            Compactness = compactness,
-                            Area = area
-                        });
-                    }
-                }
-            }
-            
-            return triangles;
-        }
-
-        /*
-        * detectCorners: Simple corner detection using angle changes
-        */
-        private List<(int x, int y)> detectCorners(List<(int x, int y)> pixels)
-        {
-            if (pixels.Count < 10) return new List<(int, int)>();
-            
-            // Find convex hull or boundary
-            var boundary = extractBoundary(pixels);
-            
-            if (boundary.Count < 10) return new List<(int, int)>();
-            
-            List<(int x, int y)> corners = new List<(int x, int y)>();
-            
-            int windowSize = Math.Max(3, boundary.Count / 20);
-            
-            for (int i = 0; i < boundary.Count; i++)
-            {
-                int prevIdx = (i - windowSize + boundary.Count) % boundary.Count;
-                int nextIdx = (i + windowSize) % boundary.Count;
-                
-                var prev = boundary[prevIdx];
-                var curr = boundary[i];
-                var next = boundary[nextIdx];
-                
-                // Calculate angle
-                double angle = calculateAngle(prev, curr, next);
-                
-                // Sharp angle = corner
-                if (angle < 140) // Less than 140 degrees
-                {
-                    corners.Add(curr);
-                }
-            }
-            
-            // Cluster nearby corners
-            corners = clusterCorners(corners, 10);
-            
-            return corners;
-        }
-
-        /*
-        * extractBoundary: Extract boundary pixels from region
-        */
-        private List<(int x, int y)> extractBoundary(List<(int x, int y)> pixels)
-        {
-            HashSet<(int, int)> pixelSet = new HashSet<(int, int)>(pixels);
-            List<(int x, int y)> boundary = new List<(int x, int y)>();
-            
-            foreach (var (x, y) in pixels)
-            {
-                // Check if any neighbor is outside region
-                bool isBoundary = false;
-                for (int dy = -1; dy <= 1 && !isBoundary; dy++)
-                {
-                    for (int dx = -1; dx <= 1 && !isBoundary; dx++)
-                    {
-                        if (dx == 0 && dy == 0) continue;
-                        if (!pixelSet.Contains((x + dx, y + dy)))
-                            isBoundary = true;
-                    }
-                }
-                
-                if (isBoundary)
-                    boundary.Add((x, y));
-            }
-            
-            return boundary;
-        }
-
-        /*
-        * calculateAngle: Calculate angle between three points
-        */
-        private double calculateAngle((int x, int y) p1, (int x, int y) p2, (int x, int y) p3)
-        {
-            double dx1 = p1.x - p2.x;
-            double dy1 = p1.y - p2.y;
-            double dx2 = p3.x - p2.x;
-            double dy2 = p3.y - p2.y;
-            
-            double dot = dx1 * dx2 + dy1 * dy2;
-            double len1 = Math.Sqrt(dx1 * dx1 + dy1 * dy1);
-            double len2 = Math.Sqrt(dx2 * dx2 + dy2 * dy2);
-            
-            if (len1 == 0 || len2 == 0) return 180;
-            
-            double cosAngle = dot / (len1 * len2);
-            cosAngle = Math.Max(-1, Math.Min(1, cosAngle));
-            
-            return Math.Acos(cosAngle) * 180 / Math.PI;
-        }
-
-        /*
-        * clusterCorners: Merge nearby corner points
-        */
-        private List<(int x, int y)> clusterCorners(List<(int x, int y)> corners, int threshold)
-        {
-            if (corners.Count == 0) return corners;
-            
-            List<(int x, int y)> clustered = new List<(int x, int y)>();
-            bool[] used = new bool[corners.Count];
-            
-            for (int i = 0; i < corners.Count; i++)
-            {
-                if (used[i]) continue;
-                
-                List<(int x, int y)> cluster = new List<(int x, int y)> { corners[i] };
-                used[i] = true;
-                
-                for (int j = i + 1; j < corners.Count; j++)
-                {
-                    if (used[j]) continue;
-                    
-                    double dist = Math.Sqrt(
-                        Math.Pow(corners[i].x - corners[j].x, 2) +
-                        Math.Pow(corners[i].y - corners[j].y, 2));
-                    
-                    if (dist < threshold)
-                    {
-                        cluster.Add(corners[j]);
-                        used[j] = true;
-                    }
-                }
-                
-                // Average position
-                int avgX = (int)cluster.Average(p => p.x);
-                int avgY = (int)cluster.Average(p => p.y);
-                clustered.Add((avgX, avgY));
-            }
-            
-            return clustered;
-        }
-
-        /*
-        * calculatePerimeter: Calculate region perimeter
-        */
-        private int calculatePerimeter(List<(int x, int y)> pixels, byte[,] labels, byte label, int h, int w)
-        {
-            HashSet<(int, int)> pixelSet = new HashSet<(int, int)>(pixels);
-            int perimeter = 0;
-            
-            foreach (var (x, y) in pixels)
-            {
-                for (int dy = -1; dy <= 1; dy++)
-                {
-                    for (int dx = -1; dx <= 1; dx++)
-                    {
-                        if (dx == 0 && dy == 0) continue;
-                        
-                        int nx = x + dx;
-                        int ny = y + dy;
-                        
-                        if (nx < 0 || nx >= w || ny < 0 || ny >= h || !pixelSet.Contains((nx, ny)))
-                        {
-                            perimeter++;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            return perimeter;
-        }
-
-        /*
-        * filterTrafficSigns: Apply validation filters
-        */
-        private List<TrafficSignCandidate> filterTrafficSigns(
-            List<TrafficSignCandidate> candidates,
-            int imageWidth,
-            int imageHeight,
-            StringBuilder log)
-        {
-            List<TrafficSignCandidate> valid = new List<TrafficSignCandidate>();
-            
-            int rejected = 0;
-            
-            foreach (var sign in candidates)
-            {
-                // Filter 1: Position (upper 70% of image)
-                if (sign.CenterY > imageHeight * 0.7)
-                {
-                    rejected++;
-                    continue;
-                }
-                
-                // Filter 2: Size
-                if (sign.Area < 200 || sign.Area > 30000)
-                {
-                    rejected++;
-                    continue;
-                }
-                
-                // Filter 3: Compactness
-                if (sign.Compactness < 0.5)
-                {
-                    rejected++;
-                    continue;
-                }
-                
-                // Filter 4: Confidence
-                if (sign.Confidence < 0.3)
-                {
-                    rejected++;
-                    continue;
-                }
-                
-                valid.Add(sign);
-            }
-            
-            log.AppendLine($"  Rejected: {rejected}");
-            log.AppendLine($"  Filters applied:");
-            log.AppendLine($"    - Position: y < 70% height");
-            log.AppendLine($"    - Size: 200 < area < 30000 px");
-            log.AppendLine($"    - Compactness: > 0.5");
-            log.AppendLine($"    - Confidence: > 0.3");
-            
-            return valid;
-        }
-
-        /*
-        * drawTrafficSigns: Visualize detected signs on RGB image
-        */
-        private byte[,,] drawTrafficSigns(
-            byte[,] baseImage,
-            List<TrafficSignCandidate> signs,
-            StringBuilder log)
+        private byte[,,] drawEllipsesOnImage(byte[,] baseImage, List<EllipseParams> ellipses)
         {
             int h = baseImage.GetLength(0);
             int w = baseImage.GetLength(1);
@@ -2973,157 +2732,121 @@ namespace INFOIBV
                 for (int x = 0; x < w; x++)
                     output[y, x, 0] = output[y, x, 1] = output[y, x, 2] = baseImage[y, x];
             
-            int circleCount = 0;
-            int triangleCount = 0;
-            
-            foreach (var sign in signs)
+            // Draw ellipses
+            foreach (var ellipse in ellipses)
             {
-                if (sign.Type == "Circle")
+                // Draw ellipse perimeter - MULTIPLE PASSES FOR THICKNESS
+                for (double t = 0; t < 2 * Math.PI; t += 0.005) // Smaller step for smoother curve
                 {
-                    circleCount++;
-                    // Draw red circle
-                    drawCircleOnImage(output, sign.CenterX, sign.CenterY, (int)sign.Radius, 255, 0, 0);
-                    // Draw green center cross
-                    drawCross(output, sign.CenterX, sign.CenterY, 10, 0, 255, 0);
-                }
-                else if (sign.Type == "Triangle")
-                {
-                    triangleCount++;
-                    // Draw blue triangle
-                    if (sign.Corners != null && sign.Corners.Count >= 3)
+                    double xLocal = ellipse.a * Math.Cos(t);
+                    double yLocal = ellipse.b * Math.Sin(t);
+                    
+                    int centerX = (int)(ellipse.cx + xLocal * Math.Cos(ellipse.theta) - yLocal * Math.Sin(ellipse.theta));
+                    int centerY = (int)(ellipse.cy + xLocal * Math.Sin(ellipse.theta) + yLocal * Math.Cos(ellipse.theta));
+                    
+                    // Draw THICK line (7 pixels thick)
+                    for (int dy = -3; dy <= 3; dy++)
                     {
-                        drawTriangleOnImage(output, sign.Corners, 0, 0, 255);
+                        for (int dx = -3; dx <= 3; dx++)
+                        {
+                            int x = centerX + dx;
+                            int y = centerY + dy;
+                            
+                            if (x >= 0 && x < w && y >= 0 && y < h)
+                            {
+                                output[y, x, 0] = 255;  // RED (changed from blue)
+                                output[y, x, 1] = 0;
+                                output[y, x, 2] = 0;
+                            }
+                        }
                     }
-                    // Draw green center cross
-                    drawCross(output, sign.CenterX, sign.CenterY, 10, 0, 255, 0);
+                }
+                
+                // Draw center cross - LARGER AND BRIGHTER GREEN
+                int cx = (int)ellipse.cx;
+                int cy = (int)ellipse.cy;
+                
+                int crossSize = 20; // Larger cross
+                int crossThickness = 5; // Thicker cross
+                
+                // Horizontal line
+                for (int i = -crossSize; i <= crossSize; i++)
+                {
+                    for (int t = -crossThickness; t <= crossThickness; t++)
+                    {
+                        int x = cx + i;
+                        int y = cy + t;
+                        
+                        if (x >= 0 && x < w && y >= 0 && y < h)
+                        {
+                            output[y, x, 0] = 0;
+                            output[y, x, 1] = 255; // Bright GREEN
+                            output[y, x, 2] = 0;
+                        }
+                    }
+                }
+                
+                // Vertical line
+                for (int i = -crossSize; i <= crossSize; i++)
+                {
+                    for (int t = -crossThickness; t <= crossThickness; t++)
+                    {
+                        int x = cx + t;
+                        int y = cy + i;
+                        
+                        if (x >= 0 && x < w && y >= 0 && y < h)
+                        {
+                            output[y, x, 0] = 0;
+                            output[y, x, 1] = 255; // Bright GREEN
+                            output[y, x, 2] = 0;
+                        }
+                    }
                 }
             }
-            
-            log.AppendLine($"  Circles drawn: {circleCount} (red)");
-            log.AppendLine($"  Triangles drawn: {triangleCount} (blue)");
             
             return output;
         }
 
         /*
-        * drawCircleOnImage: Draw circle outline on RGB image
+        * convertGrayscaleToRGB: Helper to convert grayscale to RGB
         */
-        private void drawCircleOnImage(byte[,,] image, int cx, int cy, int radius, byte r, byte g, byte b)
+        private byte[,,] convertGrayscaleToRGB(byte[,] grayscale)
+        {
+            int h = grayscale.GetLength(0);
+            int w = grayscale.GetLength(1);
+            byte[,,] rgb = new byte[h, w, 3];
+            
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                    rgb[y, x, 0] = rgb[y, x, 1] = rgb[y, x, 2] = grayscale[y, x];
+            
+            return rgb;
+        }
+
+        /*
+        * saveDebugImage: Save intermediate image to disk
+        */
+        private void saveDebugImage(byte[,] image, string filename)
         {
             int h = image.GetLength(0);
             int w = image.GetLength(1);
             
-            for (int angle = 0; angle < 360; angle++)
-            {
-                double rad = angle * Math.PI / 180.0;
-                
-                for (int thickness = -2; thickness <= 2; thickness++)
-                {
-                    int x = cx + (int)((radius + thickness) * Math.Cos(rad));
-                    int y = cy + (int)((radius + thickness) * Math.Sin(rad));
-                    
-                    if (x >= 0 && x < w && y >= 0 && y < h)
-                    {
-                        image[y, x, 0] = r;
-                        image[y, x, 1] = g;
-                        image[y, x, 2] = b;
-                    }
-                }
-            }
-        }
-
-        /*
-        * drawTriangleOnImage: Draw triangle outline on RGB image
-        */
-        private void drawTriangleOnImage(byte[,,] image, List<(int x, int y)> corners, byte r, byte g, byte b)
-        {
-            if (corners.Count < 3) return;
+            Bitmap bmp = new Bitmap(w, h);
             
-            // Draw three edges
-            drawLineOnImage(image, corners[0], corners[1], r, g, b);
-            drawLineOnImage(image, corners[1], corners[2], r, g, b);
-            drawLineOnImage(image, corners[2], corners[0], r, g, b);
-        }
-
-        /*
-        * drawLineOnImage: Draw line between two points
-        */
-        private void drawLineOnImage(byte[,,] image, (int x, int y) p1, (int x, int y) p2, byte r, byte g, byte b)
-        {
-            int h = image.GetLength(0);
-            int w = image.GetLength(1);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    byte val = image[y, x];
+                    bmp.SetPixel(x, y, Color.FromArgb(val, val, val));
+                }
             
-            // Bresenham's line algorithm
-            int dx = Math.Abs(p2.x - p1.x);
-            int dy = Math.Abs(p2.y - p1.y);
-            int sx = p1.x < p2.x ? 1 : -1;
-            int sy = p1.y < p2.y ? 1 : -1;
-            int err = dx - dy;
+            string path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                filename + ".png"
+            );
             
-            int x = p1.x;
-            int y = p1.y;
-            
-            while (true)
-            {
-                // Draw thick line
-                for (int dy2 = -2; dy2 <= 2; dy2++)
-                {
-                    for (int dx2 = -2; dx2 <= 2; dx2++)
-                    {
-                        int px = x + dx2;
-                        int py = y + dy2;
-                        
-                        if (px >= 0 && px < w && py >= 0 && py < h)
-                        {
-                            image[py, px, 0] = r;
-                            image[py, px, 1] = g;
-                            image[py, px, 2] = b;
-                        }
-                    }
-                }
-                
-                if (x == p2.x && y == p2.y) break;
-                
-                int e2 = 2 * err;
-                if (e2 > -dy)
-                {
-                    err -= dy;
-                    x += sx;
-                }
-                if (e2 < dx)
-                {
-                    err += dx;
-                    y += sy;
-                }
-            }
-        }
-
-        /*
-        * drawCross: Draw cross marker at point
-        */
-        private void drawCross(byte[,,] image, int cx, int cy, int size, byte r, byte g, byte b)
-        {
-            int h = image.GetLength(0);
-            int w = image.GetLength(1);
-            
-            for (int i = -size; i <= size; i++)
-            {
-                // Horizontal line
-                if (cx + i >= 0 && cx + i < w && cy >= 0 && cy < h)
-                {
-                    image[cy, cx + i, 0] = r;
-                    image[cy, cx + i, 1] = g;
-                    image[cy, cx + i, 2] = b;
-                }
-                
-                // Vertical line
-                if (cx >= 0 && cx < w && cy + i >= 0 && cy + i < h)
-                {
-                    image[cy + i, cx, 0] = r;
-                    image[cy + i, cx, 1] = g;
-                    image[cy + i, cx, 2] = b;
-                }
-            }
+            bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+            bmp.Dispose();
         }
 
         /*
