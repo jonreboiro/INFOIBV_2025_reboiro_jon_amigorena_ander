@@ -1853,7 +1853,7 @@ namespace INFOIBV
         // ============= YOUR FUNCTIONS FOR ASSIGNMENT 3 GO HERE ==============
         // ====================================================================
 
-        /*
+       /*
         * detectManholes: REDESIGNED - Adaptive ellipse detection for metallic manholes
         */
         private byte[,,] detectManholes(byte[,] inputImage)
@@ -1865,6 +1865,9 @@ namespace INFOIBV
             int originalW = inputImage.GetLength(1);
             
             debugLog.AppendLine($"Original input: {originalW} x {originalH}\n");
+            
+            // Save original image for reference
+            saveDebugImage(inputImage, "debug_0_original");
             
             // ========================================
             // STEP 0: DOWNSCALING
@@ -1886,71 +1889,90 @@ namespace INFOIBV
                 wasDownscaled = true;
                 
                 debugLog.AppendLine($"  Downscaled to: {newW} x {newH}\n");
+                
+                // Save downscaled image
+                saveDebugImage(processingImage, "debug_0_downscaled");
             }
             
             int h = processingImage.GetLength(0);
             int w = processingImage.GetLength(1);
             
             // ========================================
-            // STEP 1: DETECT BRIGHT METALLIC REGIONS
+            // STEP 1: DETECT METALLIC REGIONS (REVISED)
             // ========================================
-            debugLog.AppendLine("STEP 1: Detect Bright Metallic Regions");
+            debugLog.AppendLine("STEP 1: Detect Metallic Regions (Adaptive)");
             
             // Smooth first
             float[,] gaussianFilter = createGaussianFilter(5, 1.5f);
             byte[,] smoothed = convolveImage(processingImage, gaussianFilter);
             
-            // Find BRIGHT regions (manholes are metallic = bright)
-            // Calculate adaptive threshold based on image brightness
-            long sumIntensity = 0;
+            // Save smoothed image
+            saveDebugImage(smoothed, "debug_1a_smoothed");
+            
+            // STRATEGY 1: Local adaptive thresholding instead of global
+            // This helps find locally bright regions even if they're not globally brightest
+            byte[,] locallyBrightRegions = adaptiveLocalThreshold(smoothed, 25, 10);
+            
+            saveDebugImage(locallyBrightRegions, "debug_1b_locally_bright_regions");
+            
+            // STRATEGY 2: Also detect regions with high edge density (metallic texture)
+            byte[,] edges = edgeMagnitude(smoothed, SobelX, SobelY);
+            saveDebugImage(edges, "debug_1c_edge_map");
+            
+            // Apply moderate threshold to edges
+            byte[,] strongEdges = thresholdImage(edges, 30);
+            saveDebugImage(strongEdges, "debug_1d_strong_edges");
+            
+            // STRATEGY 3: Combine both approaches
+            // Regions that are EITHER locally bright OR have strong edges
+            byte[,] candidateRegions = new byte[h, w];
             for (int y = 0; y < h; y++)
+            {
                 for (int x = 0; x < w; x++)
-                    sumIntensity += smoothed[y, x];
+                {
+                    if (locallyBrightRegions[y, x] > 0 || strongEdges[y, x] > 0)
+                        candidateRegions[y, x] = 255;
+                }
+            }
             
-            double avgIntensity = sumIntensity / (double)(h * w);
-            byte brightnessThreshold = (byte)Math.Max(avgIntensity + 30, 140); // Bright regions
+            debugLog.AppendLine($"  Combined candidate pixels from local brightness and edges\n");
             
-            byte[,] brightRegions = thresholdImage(smoothed, brightnessThreshold);
-            
-            debugLog.AppendLine($"  Avg intensity: {avgIntensity:F1}");
-            debugLog.AppendLine($"  Brightness threshold: {brightnessThreshold}");
-            
-            int brightPixels = 0;
-            for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++)
-                    if (brightRegions[y, x] > 0)
-                        brightPixels++;
-            
-            debugLog.AppendLine($"  Bright pixels: {brightPixels} ({(brightPixels * 100.0 / (h * w)):F1}%)\n");
-            
-            saveDebugImage(brightRegions, "debug_1_bright_regions");
+            saveDebugImage(candidateRegions, "debug_1e_combined_candidates");
             
             // ========================================
-            // STEP 2: FIND CIRCULAR BRIGHT BLOBS
+            // STEP 2: FIND CIRCULAR BLOBS
             // ========================================
-            debugLog.AppendLine("STEP 2: Find Circular Bright Blobs");
+            debugLog.AppendLine("STEP 2: Find Circular Blobs");
             
-            // Morphological closing to connect nearby bright regions
+            // Morphological closing to connect nearby regions
             bool[,] structElem = new bool[9, 9];
             for (int i = 0; i < 9; i++)
                 for (int j = 0; j < 9; j++)
                     structElem[i, j] = true;
             
-            byte[,] dilated = binaryDilateImage(brightRegions, structElem);
-            byte[,] closed = binaryErodeImage(dilated, structElem);
+            byte[,] dilated = binaryDilateImage(candidateRegions, structElem); // Changed from brightRegions
+            saveDebugImage(dilated, "debug_2a_dilated");
             
-            saveDebugImage(closed, "debug_2_closed_blobs");
+            byte[,] closed = binaryErodeImage(dilated, structElem);
+            saveDebugImage(closed, "debug_2b_closed_blobs");
             
             // Label connected components
             int blobCount;
             byte[,] labeled = sequentialRegionLabeling(closed, out blobCount);
             
-            debugLog.AppendLine($"  Bright blobs found: {blobCount}\n");
+            // Save labeled regions (enhanced for visualization)
+            byte[,] labeledVisualization = enhanceLabelVisualization(labeled, blobCount);
+            saveDebugImage(labeledVisualization, "debug_2c_labeled_regions");
+            
+            debugLog.AppendLine($"  Blobs found: {blobCount}\n");
             
             // ========================================
             // STEP 3: ANALYZE EACH BLOB FOR CIRCULARITY
             // ========================================
             debugLog.AppendLine("STEP 3: Analyze Blob Circularity");
+            
+            // Create visualization of accepted candidates
+            byte[,] candidatesVisualization = new byte[h, w];
             
             // Only search in right 75% (ground region)
             int minX = (int)(w * 0.25);
@@ -2006,6 +2028,10 @@ namespace INFOIBV
                         blobPixels = blobPixels
                     });
                     
+                    // Mark accepted candidates in visualization
+                    foreach (var (x, y) in blobPixels)
+                        candidatesVisualization[y, x] = 255;
+                    
                     debugLog.AppendLine($"    ✓ CANDIDATE\n");
                 }
                 else
@@ -2014,6 +2040,8 @@ namespace INFOIBV
                 }
             }
             
+            saveDebugImage(candidatesVisualization, "debug_3_accepted_candidates");
+            
             debugLog.AppendLine($"  → Candidates: {candidates.Count}\n");
             
             // ========================================
@@ -2021,13 +2049,16 @@ namespace INFOIBV
             // ========================================
             debugLog.AppendLine("STEP 4: Fit Adaptive Ellipses");
             
+            // Edges already calculated in Step 1
+            saveDebugImage(edges, "debug_4a_edge_map");
+            
             List<EllipseParams> detectedEllipses = new List<EllipseParams>();
+            
+            // Create visualization of edge points used for fitting
+            byte[,] edgePointsVisualization = new byte[h, w];
             
             foreach (var candidate in candidates)
             {
-                // Use edge points around the blob boundary for ellipse fitting
-                byte[,] edges = edgeMagnitude(smoothed, SobelX, SobelY);
-                
                 List<(int x, int y)> edgePoints = new List<(int x, int y)>();
                 
                 // Find edges near the expected ellipse boundary
@@ -2043,7 +2074,10 @@ namespace INFOIBV
                     {
                         // Check if there's an edge here
                         if (edges[y, x] > 50)
+                        {
                             edgePoints.Add((x, y));
+                            edgePointsVisualization[y, x] = 255;
+                        }
                     }
                 }
                 
@@ -2057,7 +2091,10 @@ namespace INFOIBV
                                             (y - candidate.centerY) * (y - candidate.centerY));
                         
                         if (dist > candidate.avgRadius * 0.7) // Outer pixels
+                        {
                             edgePoints.Add((x, y));
+                            edgePointsVisualization[y, x] = 200; // Slightly dimmer for fallback points
+                        }
                     }
                 }
                 
@@ -2093,6 +2130,12 @@ namespace INFOIBV
                 }
             }
             
+            saveDebugImage(edgePointsVisualization, "debug_4b_edge_points_for_fitting");
+            
+            // Create visualization of fitted ellipses
+            byte[,,] ellipsesRGB = drawEllipsesOnImage(smoothed, detectedEllipses);
+            saveDebugImageRGB(ellipsesRGB, "debug_4c_fitted_ellipses");
+            
             debugLog.AppendLine($"  → Ellipses fitted: {detectedEllipses.Count}\n");
             
             // ========================================
@@ -2116,6 +2159,10 @@ namespace INFOIBV
                     debugLog.AppendLine($"  ✗ Rejected at ({ellipse.cx:F0}, {ellipse.cy:F0})\n");
                 }
             }
+            
+            // Create visualization of validated manholes only
+            byte[,,] validatedRGB = drawEllipsesOnImage(smoothed, validManholes);
+            saveDebugImageRGB(validatedRGB, "debug_5_validated_manholes");
             
             // ========================================
             // STEP 6: SCALE BACK
@@ -2149,9 +2196,40 @@ namespace INFOIBV
             // ========================================
             byte[,,] output = drawEllipsesOnImage(inputImage, validManholes);
             
+            // Save final result
+            saveDebugImageRGB(output, "debug_6_final_result");
+            
             MessageBox.Show(debugLog.ToString(), "Manhole Detection Results");
             
             return output;
+        }
+
+        /*
+        * saveDebugImageRGB: Save intermediate RGB image to disk
+        */
+        private void saveDebugImageRGB(byte[,,] image, string filename)
+        {
+            int h = image.GetLength(0);
+            int w = image.GetLength(1);
+            
+            Bitmap bmp = new Bitmap(w, h);
+            
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    byte r = image[y, x, 0];
+                    byte g = image[y, x, 1];
+                    byte b = image[y, x, 2];
+                    bmp.SetPixel(x, y, Color.FromArgb(r, g, b));
+                }
+            
+            string path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                filename + ".png"
+            );
+            
+            bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+            bmp.Dispose();
         }
 
         /*
@@ -2165,6 +2243,58 @@ namespace INFOIBV
             public double circularity { get; set; }
             public double elongation { get; set; }
             public List<(int x, int y)> blobPixels { get; set; }
+        }
+
+        /*
+        * adaptiveLocalThreshold: Apply local adaptive thresholding
+        * A pixel is considered "bright" if it's brighter than its local neighborhood average
+        * input:   image           grayscale image
+        *          windowSize      size of local neighborhood (should be odd)
+        *          offset          how much brighter than average (0-255)
+        * output:                  binary image (255 = locally bright, 0 = dark)
+        */
+        private byte[,] adaptiveLocalThreshold(byte[,] image, int windowSize, int offset)
+        {
+            int h = image.GetLength(0);
+            int w = image.GetLength(1);
+            byte[,] output = new byte[h, w];
+            
+            int half = windowSize / 2;
+            
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    // Calculate local average
+                    int sum = 0;
+                    int count = 0;
+                    
+                    for (int dy = -half; dy <= half; dy++)
+                    {
+                        for (int dx = -half; dx <= half; dx++)
+                        {
+                            int ny = y + dy;
+                            int nx = x + dx;
+                            
+                            if (ny >= 0 && ny < h && nx >= 0 && nx < w)
+                            {
+                                sum += image[ny, nx];
+                                count++;
+                            }
+                        }
+                    }
+                    
+                    double localAvg = sum / (double)count;
+                    
+                    // Pixel is "bright" if it's above local average + offset
+                    if (image[y, x] > localAvg + offset)
+                        output[y, x] = 255;
+                    else
+                        output[y, x] = 0;
+                }
+            }
+            
+            return output;
         }
 
         /*
@@ -2238,8 +2368,8 @@ namespace INFOIBV
             bool brighterThanBackground = avgInt > avgExt + 10;
             bool hasTexture = stdInt > 10;
             bool hasDarkDetails = darkSpotRatio > 0.05;
-            
-            bool isMetallic = isBright && brighterThanBackground && hasTexture && hasDarkDetails;
+
+            bool isMetallic = isBright && brighterThanBackground;
             
             log.AppendLine($"    Bright: {isBright}, Contrast: {brighterThanBackground}, " +
                         $"Texture: {hasTexture}, Details: {hasDarkDetails}");
